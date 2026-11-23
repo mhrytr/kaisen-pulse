@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>回線パルス</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+JP:wght@400;500;700&display=swap">
+<style>
+/* Layout: 計器パネル風。上に数値4つ、下に毎秒グラフ2段（速度・遅延）と統計 */
+:root{
+  --bg:#eef1f4; --panel:#ffffff; --fg:#17202a; --muted:#5d6b7a; --line:#d5dbe2;
+  --dl:#1f6fd1; --ul:#d9731a; --lat:#7a4cc2; --ok:#1e8a4c; --warn:#b7791f; --bad:#c53030;
+  --font-body:"IBM Plex Sans JP",system-ui,sans-serif;
+  --font-num:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#0f1419; --panel:#171e26; --fg:#e4e9ee; --muted:#8b98a6; --line:#2a3440;
+    --dl:#5aa2ff; --ul:#ff9d4d; --lat:#b18cf0; --ok:#4cc27e; --warn:#e0b04a; --bad:#f06c6c; color-scheme:dark }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 var(--font-body);
+  padding:24px max(16px,env(safe-area-inset-right)) 48px max(16px,env(safe-area-inset-left))}
+.wrap{max-width:1040px;margin:0 auto;display:grid;gap:20px}
+header{display:flex;flex-wrap:wrap;align-items:end;justify-content:space-between;gap:12px}
+h1{margin:0;font-size:26px;letter-spacing:.02em}
+h1 small{display:block;font-size:13px;font-weight:400;color:var(--muted)}
+.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+button,select{font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--fg);padding:9px 16px;cursor:pointer}
+button.primary{background:var(--dl);border-color:var(--dl);color:#fff;font-weight:700}
+button.stop{background:var(--bad);border-color:var(--bad);color:#fff}
+button:disabled{opacity:.5;cursor:not-allowed}
+button:focus-visible,select:focus-visible{outline:3px solid var(--dl);outline-offset:2px}
+.readouts{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+@media (max-width:720px){.readouts{grid-template-columns:repeat(2,1fr)}}
+.ro{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;min-width:0}
+.ro .lbl{font-size:12px;color:var(--muted);letter-spacing:.06em;display:flex;align-items:center;gap:6px}
+.ro .lbl i{width:10px;height:10px;border-radius:2px;display:inline-block}
+.ro .val{font:600 34px/1.15 var(--font-num);font-variant-numeric:tabular-nums;margin-top:4px;white-space:nowrap}
+.ro .unit{font:400 13px var(--font-num);color:var(--muted);margin-left:4px}
+.ro.active{border-color:var(--dl)}
+.status{font-size:13px;color:var(--muted);min-height:1.6em}
+.status.err{color:var(--bad)}
+section.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;display:grid;gap:10px;min-width:0}
+.card h2{margin:0;font-size:15px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.card h2 span{font-weight:400;color:var(--muted);font-size:12px}
+canvas{width:100%;display:block}
+.legend{display:flex;gap:16px;font-size:12px;color:var(--muted);flex-wrap:wrap}
+.legend i{display:inline-block;width:14px;height:3px;vertical-align:middle;margin-right:5px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:4px 24px;font-size:13px}
+.stats div{display:flex;justify-content:space-between;border-bottom:1px dashed var(--line);padding:3px 0}
+.stats b{font:600 13px var(--font-num);font-variant-numeric:tabular-nums}
+.card h2 .pill{color:#fff}
+.pill{display:inline-block;padding:1px 10px;border-radius:99px;font-size:12px;font-weight:700;color:#fff}
+.note{font-size:12px;color:var(--muted)}
+@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>回線パルス<small>インターネット速度と毎秒のブレを測る</small></h1>
+    <div class="controls">
+      <button id="btnTest" class="primary">速度測定を開始</button>
+      <select id="monDur" aria-label="モニター時間">
+        <option value="30">30秒</option>
+        <option value="60" selected>60秒</option>
+        <option value="180">3分</option>
+        <option value="0">停止するまで</option>
+      </select>
+      <button id="btnMon">連続モニター</button>
+    </div>
+  </header>
+
+  <div class="readouts">
+    <div class="ro" id="roDl"><div class="lbl"><i style="background:var(--dl)"></i>ダウンロード</div><div class="val"><span id="vDl">--</span><span class="unit">Mbps</span></div></div>
+    <div class="ro" id="roUl"><div class="lbl"><i style="background:var(--ul)"></i>アップロード</div><div class="val"><span id="vUl">--</span><span class="unit">Mbps</span></div></div>
+    <div class="ro" id="roPing"><div class="lbl"><i style="background:var(--lat)"></i>Ping</div><div class="val"><span id="vPing">--</span><span class="unit">ms</span></div></div>
+    <div class="ro" id="roJit"><div class="lbl"><i style="background:var(--muted)"></i>ジッター</div><div class="val"><span id="vJit">--</span><span class="unit">ms</span></div></div>
+  </div>
+  <div class="status" id="status">「速度測定を開始」で Ping → ダウンロード → アップロードの順に測ります。</div>
+
+  <section class="card">
+    <h2>毎秒の通信速度 <span id="speedMeta">1秒ごとの実測値</span></h2>
+    <canvas id="cSpeed" height="240"></canvas>
+    <div class="legend"><span><i style="background:var(--dl)"></i>ダウンロード</span><span><i style="background:var(--ul)"></i>アップロード</span><span><i style="background:var(--muted);height:1px;border-top:1px dashed var(--muted)"></i>平均</span></div>
+  </section>
+
+  <section class="card">
+    <h2>毎秒の応答時間（遅延） <span>速度測定は待機時、連続モニターは通信中（1秒ごと）の遅延</span></h2>
+    <canvas id="cLat" height="170"></canvas>
+    <div class="legend"><span><i style="background:var(--lat)"></i>Ping</span><span><i style="background:var(--bad);height:8px;width:8px;border-radius:50%"></i>応答なし／タイムアウト</span></div>
+  </section>
+
+  <section class="card">
+    <h2>ブレの統計 <span id="stab"></span></h2>
+    <div class="stats" id="stats"><div><span>まだデータがありません</span><b></b></div></div>
+    <div class="note">変動係数（CV）＝標準偏差÷平均。速度のCVが10%未満なら安定、30%以上なら大きくブレています。測定先は Cloudflare の速度測定サーバー（speed.cloudflare.com）です。モバイル回線ではデータ量にご注意ください。</div>
+  </section>
+</div>
+
+<script>
+const BASE = "https://speed.cloudflare.com";
+const $ = id => document.getElementById(id);
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+let running = false, abortAll = null;
+let speed = { dl: [], ul: [] };   // [{t, v}] t=秒
+let lat = [];                     // [{t, v|null}]
+let bytesUsed = 0;
+
+/* ---------- 計測プリミティブ ---------- */
+// サーバーエラー（429 など）の記録。リトライ間隔は指数的に延ばす
+const backoff = n => Math.min(8000, 400 * 2**n) * (0.75 + Math.random()*0.5);
+function noteHttp(counter, status){ counter.errs = (counter.errs||0)+1; if(status===429) counter.limited = true; if(status) counter.lastStatus = status; }
+
+async function pingOnce(signal){
+  const ctl = new AbortController();
+  const to = setTimeout(()=>ctl.abort(), 3000);
+  const onAbort = ()=>ctl.abort(); signal?.addEventListener("abort", onAbort);
+  try{
+    const t0 = performance.now();
+    const r = await fetch(`${BASE}/__down?bytes=0&r=${Math.random()}`, {cache:"no-store", signal:ctl.signal});
+    await r.arrayBuffer();
+    if(!r.ok){ if(r.status===429) rateLimited = true; return null; }   // エラー応答は Ping として数えない
+    return performance.now() - t0;
+  }catch(e){ return null; }
+  finally{ clearTimeout(to); signal?.removeEventListener("abort", onAbort); }
+}
+
+// 1回の要求サイズ。拒否されたら小さいサイズへ自動で切り替える（環境によって大きな要求が弾かれるため）
+const DL_SIZES = [25e6, 10e6, 2e6, 5e5, 1e5];
+const UL_SIZES = [4*1024*1024, 1024*1024, 256*1024];
+let dlLevel = 0, ulLevel = 0;
+function stepDown(kind, counter){
+  if(kind==="dl" && dlLevel < DL_SIZES.length-1){ dlLevel++; counter.steps++; return true; }
+  if(kind==="ul" && ulLevel < UL_SIZES.length-1){ ulLevel++; counter.steps++; return true; }
+  return false;
+}
+
+// 並列ストリームでダウンロードし続け、counter.bytes に加算
+function downloadStreams(n, counter, signal){
+  const one = async () => {
+    let fails = 0;
+    while(!signal.aborted){
+      const lvl = dlLevel; let got = 0;
+      try{
+        const r = await fetch(`${BASE}/__down?bytes=${DL_SIZES[lvl]}&r=${Math.random()}`, {cache:"no-store", signal});
+        if(!r.ok || !r.body){
+          r.body?.cancel().catch(()=>{}); noteHttp(counter, r.status);
+          if(lvl!==dlLevel){ counter.steps++; continue; }  // 他のストリームがすでにサイズを下げた
+          if(stepDown("dl", counter)) continue;
+          await sleep(backoff(fails++), signal); continue;
+        }
+        const rd = r.body.getReader();
+        for(;;){ const {done, value} = await rd.read(); if(done) break; got += value.length; counter.bytes += value.length; bytesUsed += value.length; }
+        fails = 0;
+      }catch(e){
+        if(signal.aborted) return;
+        noteHttp(counter, 0); counter.lastErr = e?.message;
+        // 1バイトも受け取れずに失敗したら、要求サイズを下げて再試行
+        if(got===0 && lvl!==dlLevel){ counter.steps++; continue; }
+        if(got===0 && stepDown("dl", counter)) continue;
+        await sleep(backoff(fails++), signal);
+      }
+    }
+  };
+  return Promise.all(Array.from({length:n}, one));
+}
+
+function uploadStreams(n, counter, signal){
+  const blobs = {};
+  const blobFor = lvl => blobs[lvl] ??= new Blob([new Uint8Array(UL_SIZES[lvl])]);
+  const one = () => new Promise(res => {
+    let fails = 0, cur = null;
+    const onAbort = () => { cur?.abort(); res(); };
+    signal.addEventListener("abort", onAbort, {once:true});
+    const loop = () => {
+      if(signal.aborted) return res();
+      const lvl = ulLevel, blob = blobFor(lvl);
+      const x = cur = new XMLHttpRequest(); let last = 0;
+      x.open("POST", `${BASE}/__up?r=${Math.random()}`);
+      x.setRequestHeader("Content-Type","text/plain");
+      x.upload.onprogress = e => { const d = e.loaded - last; last = e.loaded; counter.bytes += d; bytesUsed += d; };
+      x.onloadend = () => {
+        if(signal.aborted) return res();
+        const ok = x.status >= 200 && x.status < 300;
+        if(ok){
+          if(last < blob.size){ const d = blob.size - last; counter.bytes += d; bytesUsed += d; }
+          fails = 0; loop();
+        }else{
+          noteHttp(counter, x.status);
+          if(lvl!==ulLevel){ counter.steps++; return loop(); }
+          if(stepDown("ul", counter)) return loop();
+          setTimeout(loop, backoff(fails++));
+        }
+      };
+      x.send(blob);
+    };
+    loop();
+  });
+  return Promise.all(Array.from({length:n}, one));
+}
+
+const sleep = (ms, signal) => new Promise(r=>{
+  const t = setTimeout(done, ms); function done(){ clearTimeout(t); signal?.removeEventListener("abort", done); r(); }
+  signal?.addEventListener("abort", done, {once:true});
+});
+const mbps = (bytes, sec) => sec>0 ? bytes*8/sec/1e6 : 0;
+let rateLimited = false, wasHidden = false;
+document.addEventListener("visibilitychange", ()=>{ if(document.hidden && running) wasHidden = true; });
+
+// 1秒ごとのサンプラー。タブが裏に回ってタイマーが間引かれても、実際の経過時間で計算する
+function sampler(counter, onSample, onLive){
+  const start = performance.now();
+  let lastBytes = 0, lastT = start, nextSec = 1;
+  const hist = [];  // 表示用：直近1秒の移動平均
+  const timer = setInterval(()=>{
+    const now = performance.now();
+    hist.push([now, counter.bytes]); while(hist.length>1 && now-hist[0][0] > 1000) hist.shift();
+    if(onLive && hist.length>1) onLive(mbps(counter.bytes-hist[0][1], (now-hist[0][0])/1000));
+    const el = (now-start)/1000;
+    if(el >= nextSec - 0.02){
+      const v = mbps(counter.bytes-lastBytes, (now-lastT)/1000);
+      lastBytes = counter.bytes; lastT = now;
+      const t = Math.max(nextSec, Math.round(el));
+      nextSec = t + 1;
+      onSample(t, v, el);
+    }
+  }, 200);
+  return () => clearInterval(timer);
+}
+
+function failMessage(counter){
+  if(counter?.limited || rateLimited) return "測定サーバーから一時的にアクセスを制限されました（429）。数分待ってからもう一度お試しください。";
+  if(counter?.lastStatus) return `測定サーバーがエラーを返しました（HTTP ${counter.lastStatus}）。少し時間をおいてお試しください。`;
+  if(lat.some(x=>x.v!=null)) return "Ping は届きましたが、速度測定用のデータ転送がサーバーに拒否されました。数分待ってからもう一度お試しください。" + (counter?.lastErr?`（詳細: ${counter.lastErr}）`:"");
+  return null;  // 原因の切り分けは diagnose() で行う
+}
+// Ping も届かなかったときの原因診断：
+//  no-cors の要求は CORS の可否に関係なく「通信が届いたか」だけを返す
+async function diagnose(){
+  if(navigator.onLine === false) return "インターネットに接続されていません。Wi-Fi や LAN ケーブルを確認してください。";
+  const probe = async url => { const c = new AbortController(); const t = setTimeout(()=>c.abort(), 5000);
+    try{ await fetch(url, {mode:"no-cors", cache:"no-store", signal:c.signal}); return true; }catch(e){ return false; } finally{ clearTimeout(t); } };
+  const cf = await probe(`${BASE}/__down?bytes=0&r=${Math.random()}`);
+  if(cf) return "測定サーバー（speed.cloudflare.com）には届いていますが、応答を拒否されました。短時間に何度も測ると一時的に制限されることがあります。5〜10分ほど待ってからもう一度お試しください。";
+  const other = await probe(`https://www.google.com/generate_204?r=${Math.random()}`) || await probe(`https://www.cloudflare.com/favicon.ico?r=${Math.random()}`);
+  if(other) return "インターネットにはつながっていますが、このネットワークでは測定サーバー（speed.cloudflare.com）への接続がブロックされています。学校や会社のフィルター、セキュリティソフトが原因の可能性があります。別のネットワーク（自宅の回線やスマホのテザリングなど）でお試しください。";
+  return "インターネットに接続できませんでした。ネットワーク接続を確認して、もう一度お試しください。";
+}
+async function showFailure(counter){
+  setStatus("接続できなかった原因を調べています…");
+  setStatus(failMessage(counter) ?? await diagnose(), true);
+}
+class StopError extends Error {}
+
+// 指定秒数、毎秒の速度を記録しながら転送
+async function measurePhase(kind, seconds, outerSignal){
+  const ctl = new AbortController();
+  const fwd = ()=>ctl.abort(); outerSignal.addEventListener("abort", fwd, {once:true});
+  const counter = {bytes:0, steps:0};
+  const runner = kind==="dl" ? downloadStreams(4, counter, ctl.signal) : uploadStreams(3, counter, ctl.signal);
+  const series = speed[kind], el = $(kind==="dl"?"vDl":"vUl");
+  await new Promise(resolve => {
+    const stop = sampler(counter, (t, v, elapsed)=>{
+      series.push({t, v}); drawAll();
+      if(elapsed >= seconds){ stop(); resolve(); }
+    }, v => el.textContent = fmt(v));
+    ctl.signal.addEventListener("abort", ()=>{ stop(); resolve(); }, {once:true});
+  });
+  ctl.abort(); outerSignal.removeEventListener("abort", fwd);
+  await runner.catch(()=>{});
+  if(outerSignal.aborted) throw new StopError();
+  if(counter.bytes === 0) throw Object.assign(new Error("no-data"), {counter});
+  // 立ち上がりの1秒を除いた平均
+  const valid = series.filter(p=>p.t>1);
+  const avg = mean((valid.length?valid:series).map(p=>p.v));
+  el.textContent = fmt(avg);
+  if((counter.errs||0) > (counter.steps||0)) counter.warn = true;
+  return counter;
+}
+
+/* ---------- 速度測定 ---------- */
+async function runTest(){
+  begin("test");
+  speed = {dl:[], ul:[]}; lat = []; bytesUsed = 0; rateLimited = false; wasHidden = false;
+  ["vDl","vUl","vPing","vJit"].forEach(id=>$(id).textContent="--");
+  drawAll(); updateStats();
+  const signal = abortAll.signal;
+  const warns = [];
+  try{
+    setStatus("Ping を測定中…"); active("roPing");
+    const pings = [];
+    for(let i=0;i<12 && !signal.aborted;i++){
+      const p = await pingOnce(signal);
+      if(i>0){ lat.push({t:i, v:p}); if(p!=null){ pings.push(p); $("vPing").textContent = fmt(median(pings),1); } drawAll(); }
+    }
+    if(signal.aborted) throw new StopError();
+    if(!pings.length) throw new Error("no-data");
+    $("vPing").textContent = fmt(median(pings),1);
+    $("vJit").textContent = fmt(jitter(pings),1);
+    updateStats();
+
+    setStatus("ダウンロード速度を測定中…（10秒）"); active("roDl");
+    const c1 = await measurePhase("dl", 10, signal);
+    setStatus("アップロード速度を測定中…（10秒）"); active("roUl");
+    const c2 = await measurePhase("ul", 10, signal);
+    if(c1.warn || c2.warn) warns.push("途中でサーバーエラーがあり、値が低めに出ている可能性があります");
+    if(wasHidden) warns.push("測定中にタブが裏に回ったため、値が不正確な可能性があります");
+    setStatus(`測定完了　使用データ量 約${fmt(bytesUsed/1e6,0)} MB${warns.length?"　※"+warns.join("。"):""}`);
+  }catch(e){
+    if(e instanceof StopError) setStatus(`停止しました　使用データ量 約${fmt(bytesUsed/1e6,0)} MB`);
+    else await showFailure(e.counter);
+  }finally{ end(); updateStats(); }
+}
+
+/* ---------- 連続モニター ---------- */
+async function runMonitor(){
+  begin("mon");
+  speed = {dl:[], ul:[]}; lat = []; bytesUsed = 0; rateLimited = false; wasHidden = false;
+  ["vDl","vUl","vPing","vJit"].forEach(id=>$(id).textContent="--");
+  drawAll(); updateStats();
+  const dur = +$("monDur").value;
+  const signal = abortAll.signal;
+  const counter = {bytes:0, steps:0};
+  // 速度は 2 本の連続ダウンロードで、遅延はそれとは別に毎秒 Ping（通信中の遅延）
+  const runner = downloadStreams(2, counter, signal);
+  let pingBusy = false, lastSec = 0, failed = false;
+  active("roDl");
+  await new Promise(resolve=>{
+    const stop = sampler(counter, (sec, v)=>{
+      lastSec = sec;
+      speed.dl.push({t:sec, v});
+      if(!pingBusy){
+        pingBusy = true;
+        pingOnce(signal).then(p=>{
+          pingBusy = false; if(signal.aborted) return;
+          lat.push({t:sec, v:p});
+          const ok = lat.filter(x=>x.v!=null).map(x=>x.v);
+          if(p!=null) $("vPing").textContent = fmt(p,1);
+          if(ok.length>1) $("vJit").textContent = fmt(jitter(ok),1);
+          drawAll(); updateStats();
+        });
+      }
+      drawAll(); updateStats();
+      const remain = dur ? `残り${Math.max(0,dur-sec)}秒　` : "";
+      const note = counter.limited ? "　※サーバーの制限で速度が落ちています" : "";
+      setStatus(`連続モニター中… ${sec}秒経過　${remain}使用データ量 約${fmt(bytesUsed/1e6,0)} MB${note}`);
+      if(sec>=8 && counter.bytes===0){ failed = true; abortAll.abort(); }
+      if(dur && sec>=dur){ abortAll.abort(); }
+    }, v => $("vDl").textContent = fmt(v));
+    signal.addEventListener("abort", ()=>{ stop(); resolve(); }, {once:true});
+  });
+  await runner.catch(()=>{});
+  if(failed) await showFailure(counter);
+  else setStatus(`モニター終了（${lastSec}秒）　使用データ量 約${fmt(bytesUsed/1e6,0)} MB${wasHidden?"　※途中でタブが裏に回ったため、その間の値は不正確な可能性があります":""}`);
+  end(); updateStats();
+}
+
+/* ---------- UI 状態 ---------- */
+let mode = null;
+function begin(m){
+  running = true; mode = m; abortAll = new AbortController();
+  $("btnTest").disabled = m!=="test"; $("btnMon").disabled = m!=="mon";
+  const b = m==="test" ? $("btnTest") : $("btnMon");
+  b.textContent = "停止"; b.classList.add("stop"); b.classList.remove("primary");
+  $("monDur").disabled = true;
+}
+function end(){
+  running = false; mode = null; active(null);
+  $("btnTest").disabled = $("btnMon").disabled = $("monDur").disabled = false;
+  $("btnTest").textContent = "速度測定を開始"; $("btnTest").className = "primary";
+  $("btnMon").textContent = "連続モニター"; $("btnMon").className = "";
+}
+function active(id){ document.querySelectorAll(".ro").forEach(e=>e.classList.toggle("active", e.id===id)); }
+function setStatus(t, err){ const s=$("status"); s.textContent=t; s.classList.toggle("err", !!err); }
+$("btnTest").onclick = ()=> running ? abortAll.abort() : runTest();
+$("btnMon").onclick  = ()=> running ? abortAll.abort() : runMonitor();
+
+/* ---------- 統計 ---------- */
+const mean = a => a.reduce((s,x)=>s+x,0)/(a.length||1);
+const sd = a => { const m=mean(a); return Math.sqrt(mean(a.map(x=>(x-m)**2))); };
+const median = a => { const s=[...a].sort((x,y)=>x-y), k=s.length>>1; return s.length%2?s[k]:(s[k-1]+s[k])/2; };
+const jitter = a => a.length<2?0:mean(a.slice(1).map((x,i)=>Math.abs(x-a[i])));
+const fmt = (v,d) => { if(v==null||!isFinite(v)) return "--"; if(d==null) d = v>=100?0:v>=10?1:2; return v.toFixed(d); };
+
+function updateStats(){
+  const rows = [];
+  let worstCv = null;
+  for(const [k,name] of [["dl","下り"],["ul","上り"]]){
+    const a = speed[k].map(p=>p.v); if(a.length<2) continue;
+    const m = mean(a), cv = m? sd(a)/m*100 : 0;
+    if(m>0) worstCv = Math.max(worstCv??0, cv);
+    rows.push([`${name} 平均`, fmt(m)+" Mbps"],[`${name} 最小 / 最大`, `${fmt(Math.min(...a))} / ${fmt(Math.max(...a))}`],
+              [`${name} 標準偏差`, fmt(sd(a))+" Mbps"],[`${name} 変動係数`, fmt(cv,1)+" %"]);
+  }
+  const l = lat.filter(x=>x.v!=null).map(x=>x.v);
+  if(l.length>1){
+    rows.push(["Ping 中央値", fmt(median(l),1)+" ms"],["Ping 最小 / 最大", `${fmt(Math.min(...l),1)} / ${fmt(Math.max(...l),1)}`],
+              ["ジッター", fmt(jitter(l),1)+" ms"]);
+    const loss = lat.filter(x=>x.v==null).length/lat.length*100;
+    rows.push(["応答なしの割合", fmt(loss,1)+" %"]);
+  }
+  $("stats").innerHTML = rows.length ? rows.map(([a,b])=>`<div><span>${a}</span><b>${b}</b></div>`).join("") : `<div><span>まだデータがありません</span><b></b></div>`;
+  if(worstCv==null){ $("stab").innerHTML=""; return; }
+  const [lab,col] = worstCv<10?["安定","--ok"]:worstCv<30?["ややブレあり","--warn"]:["ブレ大","--bad"];
+  $("stab").innerHTML = `<span class="pill" style="background:var(${col})">${lab}</span>`;
+}
+
+/* ---------- グラフ描画（Canvas） ---------- */
+function niceMax(v){ if(v<=0) return 1; const p=10**Math.floor(Math.log10(v)), n=v/p; return (n<=1?1:n<=2?2:n<=5?5:10)*p; }
+
+function chart(canvas, series, {unit, minX=10, refLines=[]}){
+  const dpr = window.devicePixelRatio||1, W = canvas.clientWidth, H = +(canvas.dataset.h ??= canvas.getAttribute("height"));  // 元の高さを固定で使う（拡大率で膨らまないように）
+  canvas.width = W*dpr; canvas.height = H*dpr; canvas.style.height = H+"px";
+  const g = canvas.getContext("2d"); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
+  const pad = {l:52, r:14, t:12, b:26}, pw = W-pad.l-pad.r, ph = H-pad.t-pad.b;
+  const allPts = series.flatMap(s=>s.pts);
+  const maxT = Math.max(minX, ...allPts.map(p=>p.t));
+  const yMax = niceMax(Math.max(...allPts.filter(p=>p.v!=null).map(p=>p.v), 0)*1.1);
+  const X = t => pad.l + (t/maxT)*pw, Y = v => pad.t + ph - (v/yMax)*ph;
+  const muted = css("--muted"), line = css("--line");
+  g.font = `11px ${css("--font-num")}`; g.lineWidth = 1;
+  // y グリッド
+  for(let i=0;i<=4;i++){
+    const v = yMax*i/4, y = Y(v);
+    g.strokeStyle = line; g.beginPath(); g.moveTo(pad.l,y); g.lineTo(W-pad.r,y); g.stroke();
+    g.fillStyle = muted; g.textAlign="right"; g.textBaseline="middle"; g.fillText(fmt(v, yMax<10?1:0), pad.l-6, y);
+  }
+  g.save(); g.translate(12, pad.t+ph/2); g.rotate(-Math.PI/2); g.textAlign="center"; g.fillText(unit,0,0); g.restore();
+  // x 目盛り（秒）
+  const step = [1,2,5,10,15,30,60,120,300].find(s=>maxT/s<=10) || 600;
+  g.textAlign="center"; g.textBaseline="top";
+  for(let t=0;t<=maxT;t+=step){ g.fillStyle=muted; g.fillText(t+"s", X(t), H-pad.b+6); }
+  // 平均線など
+  for(const r of refLines){ g.setLineDash([4,4]); g.strokeStyle=r.color; g.globalAlpha=.7;
+    g.beginPath(); g.moveTo(pad.l,Y(r.v)); g.lineTo(W-pad.r,Y(r.v)); g.stroke(); g.setLineDash([]); g.globalAlpha=1; }
+  // 系列
+  for(const s of series){
+    const pts = s.pts; if(!pts.length) continue;
+    const ok = pts.filter(p=>p.v!=null);
+    if(s.area && ok.length>1){
+      const grad = g.createLinearGradient(0,pad.t,0,pad.t+ph);
+      grad.addColorStop(0, s.color+"55"); grad.addColorStop(1, s.color+"00");
+      g.fillStyle = grad; g.beginPath(); g.moveTo(X(ok[0].t), Y(0));
+      ok.forEach(p=>g.lineTo(X(p.t),Y(p.v))); g.lineTo(X(ok.at(-1).t), Y(0)); g.closePath(); g.fill();
+    }
+    g.strokeStyle = s.color; g.lineWidth = 2; g.lineJoin="round"; g.beginPath();
+    let pen=false; for(const p of pts){ if(p.v==null){pen=false;continue;} pen?g.lineTo(X(p.t),Y(p.v)):g.moveTo(X(p.t),Y(p.v)); pen=true; } g.stroke();
+    g.fillStyle = s.color; for(const p of ok){ g.beginPath(); g.arc(X(p.t),Y(p.v), pts.length>90?1.2:2.5, 0, 7); g.fill(); }
+    const last = ok.at(-1); if(last){ g.beginPath(); g.arc(X(last.t),Y(last.v),4.5,0,7); g.fill(); }
+    // 欠損（タイムアウト）
+    g.fillStyle = css("--bad"); for(const p of pts.filter(p=>p.v==null)){ g.beginPath(); g.arc(X(p.t), pad.t+ph-4, 4, 0, 7); g.fill(); }
+  }
+  if(!allPts.length){ g.fillStyle=muted; g.textAlign="center"; g.textBaseline="middle"; g.font=`13px ${css("--font-body")}`; g.fillText("測定するとここに毎秒の値が表示されます", pad.l+pw/2, pad.t+ph/2); }
+}
+
+function drawAll(){
+  const ref = []; const dl = speed.dl.map(p=>p.v), ul = speed.ul.map(p=>p.v);
+  if(dl.length>2) ref.push({v:mean(dl), color:css("--dl")});
+  if(ul.length>2) ref.push({v:mean(ul), color:css("--ul")});
+  chart($("cSpeed"), [{pts:speed.dl, color:css("--dl"), area:true},{pts:speed.ul, color:css("--ul"), area:true}], {unit:"Mbps", refLines:ref});
+  chart($("cLat"), [{pts:lat, color:css("--lat")}], {unit:"ms"});
+}
+addEventListener("resize", drawAll);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawAll);
+document.fonts?.ready.then(drawAll);
+drawAll();
+</script>
+</body>
+</html>
