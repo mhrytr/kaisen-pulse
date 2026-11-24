@@ -49,6 +49,11 @@ button:focus-visible,select:focus-visible{outline:3px solid var(--dl);outline-of
 .ro .unit{font:400 13px var(--font-num);color:var(--muted);margin-left:4px}
 .ro.active{border-color:var(--dl)}
 .status{font-size:13px;color:var(--muted);min-height:1.6em}
+.net{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 16px;min-width:0}
+.net .lbl{font-size:12px;color:var(--muted);letter-spacing:.06em}
+.net b{font-size:16px;overflow-wrap:anywhere}
+.net .sub{font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.net .chip{font-size:12px;border:1px solid var(--line);border-radius:99px;padding:0 10px;color:var(--fg)}
 .status.err{color:var(--bad)}
 section.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;display:grid;gap:10px;min-width:0}
 .card h2{margin:0;font-size:15px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
@@ -87,6 +92,12 @@ canvas{width:100%;display:block}
     <div class="ro" id="roPing"><div class="lbl"><i style="background:var(--lat)"></i>Ping</div><div class="val"><span id="vPing">--</span><span class="unit">ms</span></div></div>
     <div class="ro" id="roJit"><div class="lbl"><i style="background:var(--muted)"></i>ジッター</div><div class="val"><span id="vJit">--</span><span class="unit">ms</span></div></div>
   </div>
+  <div class="net" id="net" aria-live="polite">
+    <span class="lbl">測定するネットワーク</span>
+    <b id="netName">確認中…</b>
+    <span class="chip" id="netType" hidden></span>
+    <span class="sub" id="netSub"></span>
+  </div>
   <div class="status" id="status">「速度測定を開始」で Ping → ダウンロード → アップロードの順に測ります。</div>
 
   <section class="card">
@@ -104,7 +115,7 @@ canvas{width:100%;display:block}
   <section class="card">
     <h2>ブレの統計 <span id="stab"></span></h2>
     <div class="stats" id="stats"><div><span>まだデータがありません</span><b></b></div></div>
-    <div class="note">変動係数（CV）＝標準偏差÷平均。速度のCVが10%未満なら安定、30%以上なら大きくブレています。測定先は Cloudflare の速度測定サーバー（speed.cloudflare.com）です。モバイル回線ではデータ量にご注意ください。</div>
+    <div class="note">変動係数（CV）＝標準偏差÷平均。速度のCVが10%未満なら安定、30%以上なら大きくブレています。測定先は Cloudflare の速度測定サーバー（speed.cloudflare.com）です。ネットワーク名は回線事業者の登録名で、Cloudflare から取得できないときは ipinfo.io から取得します。Wi-Fi の名前はブラウザの仕様で読み取れません。モバイル回線ではデータ量にご注意ください。</div>
   </section>
 </div>
 
@@ -114,6 +125,62 @@ const $ = id => document.getElementById(id);
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 
 let running = false, abortAll = null;
+
+/* ---------- ネットワーク情報 ---------- */
+// Wi-Fi 名（SSID）はブラウザから読めないため、回線事業者（AS 番号と組織名）・地域・接続方式を表示する
+const ISP_JA = { 9605:"NTTドコモ", 2516:"KDDI（au）", 17676:"ソフトバンク", 138384:"楽天モバイル",
+  4713:"NTTコミュニケーションズ（OCN）", 2527:"So-net", 2518:"BIGLOBE", 2497:"IIJ",
+  17511:"オプテージ（eo）", 18126:"中部テレコミュニケーション（コミュファ）", 2907:"SINET（学術情報ネットワーク）" };
+const CONN_JA = { wifi:"Wi-Fi", cellular:"モバイル回線", ethernet:"有線LAN", wimax:"WiMAX", bluetooth:"Bluetooth" };
+let netInfo = null;
+
+async function getJSON(url, ms=5000){
+  const c = new AbortController(), t = setTimeout(()=>c.abort(), ms);
+  try{ const r = await fetch(url, {cache:"no-store", signal:c.signal}); return r.ok ? await r.json() : null; }
+  catch(e){ return null; } finally{ clearTimeout(t); }
+}
+async function fetchNetInfo(){
+  // 1) Cloudflare の速度測定サーバー自身のメタ情報
+  const m = await getJSON(`${BASE}/meta?r=${Math.random()}`);
+  if(m && (m.asOrganization || m.asn)){
+    const colo = typeof m.colo === "object" ? (m.colo?.iata || m.colo?.city) : m.colo;
+    return { asn: +m.asn || null, org: m.asOrganization || "", city: m.city, region: m.region, country: m.country, colo };
+  }
+  // 2) 取れなければ ipinfo.io（例: "AS2516 KDDI CORPORATION"）
+  const j = await getJSON("https://ipinfo.io/json");
+  if(j && j.org){
+    const mm = /^AS(\d+)\s+(.*)$/.exec(j.org);
+    return { asn: mm ? +mm[1] : null, org: mm ? mm[2] : j.org, city: j.city, region: j.region, country: j.country };
+  }
+  return null;
+}
+function connType(){
+  const t = navigator.connection?.type;
+  return t && CONN_JA[t] || null;
+}
+function renderNet(){
+  const type = connType();
+  $("netType").hidden = !type; $("netType").textContent = type || "";
+  if(!netInfo){ $("netName").textContent = "取得できませんでした"; $("netSub").textContent = ""; return; }
+  const ja = ISP_JA[netInfo.asn];
+  $("netName").textContent = ja || netInfo.org || (netInfo.asn ? `AS${netInfo.asn}` : "不明");
+  const place = [...new Set([netInfo.city, netInfo.region].filter(Boolean))].join(", ");
+  const parts = [];
+  if(netInfo.org && (ja || netInfo.asn)) parts.push(`${netInfo.asn?`AS${netInfo.asn} `:""}${ja ? netInfo.org : ""}`.trim());
+  if(place) parts.push(place + (netInfo.country && netInfo.country!=="JP" ? ` (${netInfo.country})` : ""));
+  if(netInfo.colo) parts.push(`接続先サーバー: ${netInfo.colo}`);
+  $("netSub").textContent = parts.filter(Boolean).join("　/　");
+}
+let netSeq = 0;
+async function refreshNet(){
+  const seq = ++netSeq;
+  $("netName").textContent = "確認中…"; $("netSub").textContent = "";
+  const info = await fetchNetInfo();
+  if(seq !== netSeq) return;   // 古い結果で上書きしない
+  netInfo = info; renderNet();
+}
+navigator.connection?.addEventListener?.("change", ()=>{ if(!running) refreshNet(); });
+addEventListener("online", ()=>{ if(!running) refreshNet(); });
 let speed = { dl: [], ul: [] };   // [{t, v}] t=秒
 let lat = [];                     // [{t, v|null}]
 let bytesUsed = 0;
@@ -292,7 +359,7 @@ async function measurePhase(kind, seconds, outerSignal){
 
 /* ---------- 速度測定 ---------- */
 async function runTest(){
-  begin("test");
+  begin("test"); refreshNet();
   speed = {dl:[], ul:[]}; lat = []; bytesUsed = 0; rateLimited = false; wasHidden = false;
   ["vDl","vUl","vPing","vJit"].forEach(id=>$(id).textContent="--");
   drawAll(); updateStats();
@@ -326,7 +393,7 @@ async function runTest(){
 
 /* ---------- 連続モニター ---------- */
 async function runMonitor(){
-  begin("mon");
+  begin("mon"); refreshNet();
   speed = {dl:[], ul:[]}; lat = []; bytesUsed = 0; rateLimited = false; wasHidden = false;
   ["vDl","vUl","vPing","vJit"].forEach(id=>$(id).textContent="--");
   drawAll(); updateStats();
@@ -476,6 +543,7 @@ addEventListener("resize", drawAll);
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawAll);
 document.fonts?.ready.then(drawAll);
 drawAll();
+refreshNet();
 </script>
 </body>
 </html>
