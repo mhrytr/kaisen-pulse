@@ -109,7 +109,7 @@ canvas{width:100%;display:block}
   <section class="card">
     <h2>ブレの統計 <span id="stab"></span></h2>
     <div class="stats" id="stats"><div><span>まだデータがありません</span><b></b></div></div>
-    <div class="note">変動係数（CV）＝標準偏差÷平均。連続モニターの「上り下り同時」は、とくに Wi-Fi では単独で測るより低めに出ます。速度のCVが10%未満なら安定、30%以上なら大きくブレています。測定先は Cloudflare の速度測定サーバー（speed.cloudflare.com）です。モバイル回線ではデータ量にご注意ください。</div>
+    <div class="note">変動係数（CV）＝標準偏差÷平均。統計は通信の立ち上がりの最初の1秒を除いて計算しています。連続モニターの「上り下り同時」は、とくに Wi-Fi では単独で測るより低めに出ます。速度のCVが10%未満なら安定、30%以上なら大きくブレています。測定先は Cloudflare の速度測定サーバー（speed.cloudflare.com）です。モバイル回線ではデータ量にご注意ください。</div>
   </section>
 </div>
 
@@ -420,7 +420,9 @@ function updateStats(){
   const rows = [];
   let worstCv = null;
   for(const [k,name] of [["dl","下り"],["ul","上り"]]){
-    const a = speed[k].map(p=>p.v); if(a.length<2) continue;
+    // 立ち上がり（加速中）の1秒目は除く。グラフには表示したまま
+    const steady = speed[k].filter(p=>p.t>1);
+    const a = (steady.length>=2 ? steady : speed[k]).map(p=>p.v); if(a.length<2) continue;
     const m = mean(a), cv = m? sd(a)/m*100 : 0;
     if(m>0) worstCv = Math.max(worstCv??0, cv);
     rows.push([`${name} 平均`, fmt(m)+" Mbps"],[`${name} 最小 / 最大`, `${fmt(Math.min(...a))} / ${fmt(Math.max(...a))}`],
