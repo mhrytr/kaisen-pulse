@@ -71,6 +71,11 @@ canvas{width:100%;display:block}
     <h1>回線パルス<small>インターネット速度と毎秒のブレを測る</small></h1>
     <div class="controls">
       <button id="btnTest" class="primary">速度測定を開始</button>
+      <select id="monDir" aria-label="連続モニターで測る方向">
+        <option value="both" selected>上り下り同時</option>
+        <option value="dl">下りのみ</option>
+        <option value="ul">上りのみ</option>
+      </select>
       <select id="monDur" aria-label="モニター時間">
         <option value="30">30秒</option>
         <option value="60" selected>60秒</option>
@@ -104,7 +109,7 @@ canvas{width:100%;display:block}
   <section class="card">
     <h2>ブレの統計 <span id="stab"></span></h2>
     <div class="stats" id="stats"><div><span>まだデータがありません</span><b></b></div></div>
-    <div class="note">変動係数（CV）＝標準偏差÷平均。速度のCVが10%未満なら安定、30%以上なら大きくブレています。測定先は Cloudflare の速度測定サーバー（speed.cloudflare.com）です。モバイル回線ではデータ量にご注意ください。</div>
+    <div class="note">変動係数（CV）＝標準偏差÷平均。連続モニターの「上り下り同時」は、とくに Wi-Fi では単独で測るより低めに出ます。速度のCVが10%未満なら安定、30%以上なら大きくブレています。測定先は Cloudflare の速度測定サーバー（speed.cloudflare.com）です。モバイル回線ではデータ量にご注意ください。</div>
   </section>
 </div>
 
@@ -331,16 +336,26 @@ async function runMonitor(){
   ["vDl","vUl","vPing","vJit"].forEach(id=>$(id).textContent="--");
   drawAll(); updateStats();
   const dur = +$("monDur").value;
+  const dir = $("monDir").value;
+  const kinds = dir==="both" ? ["dl","ul"] : [dir];
   const signal = abortAll.signal;
-  const counter = {bytes:0, steps:0};
-  // 速度は 2 本の連続ダウンロードで、遅延はそれとは別に毎秒 Ping（通信中の遅延）
-  const runner = downloadStreams(2, counter, signal);
+  const NAME = {dl:"ダウンロード", ul:"アップロード"}, VAL = {dl:"vDl", ul:"vUl"};
+  // 速度は 2 本ずつの連続転送で、遅延はそれとは別に毎秒 Ping（通信中の遅延）
+  const counters = {}, runners = [];
+  for(const k of kinds){
+    counters[k] = {bytes:0, steps:0};
+    runners.push((k==="dl" ? downloadStreams : uploadStreams)(2, counters[k], signal));
+  }
   let pingBusy = false, lastSec = 0, failed = false;
-  active("roDl");
+  active(kinds.length===1 ? (dir==="dl"?"roDl":"roUl") : null);
+  if(kinds.length===2){ $("roDl").classList.add("active"); $("roUl").classList.add("active"); }
+  const stops = [];
   await new Promise(resolve=>{
-    const stop = sampler(counter, (sec, v)=>{
+    // 方向ごとに毎秒の値を記録。進行管理（Ping・表示・終了判定）は最初の方向のタイマーで行う
+    kinds.forEach((k, i) => stops.push(sampler(counters[k], (sec, v)=>{
+      speed[k].push({t:sec, v});
+      if(i !== 0) return;
       lastSec = sec;
-      speed.dl.push({t:sec, v});
       if(!pingBusy){
         pingBusy = true;
         pingOnce(signal).then(p=>{
@@ -354,16 +369,23 @@ async function runMonitor(){
       }
       drawAll(); updateStats();
       const remain = dur ? `残り${Math.max(0,dur-sec)}秒　` : "";
-      const note = counter.limited ? "　※サーバーの制限で速度が落ちています" : "";
-      setStatus(`連続モニター中… ${sec}秒経過　${remain}使用データ量 約${fmt(bytesUsed/1e6,0)} MB${note}`);
-      if(sec>=8 && counter.bytes===0){ failed = true; abortAll.abort(); }
+      const notes = [];
+      if(kinds.some(k=>counters[k].limited)) notes.push("サーバーの制限で速度が落ちています");
+      if(sec>=8) for(const k of kinds) if(counters[k].bytes===0) notes.push(`${NAME[k]}を測れていません`);
+      setStatus(`連続モニター中… ${sec}秒経過　${remain}使用データ量 約${fmt(bytesUsed/1e6,0)} MB${notes.length?"　※"+notes.join("。"):""}`);
+      if(sec>=8 && kinds.every(k=>counters[k].bytes===0)){ failed = true; abortAll.abort(); }
       if(dur && sec>=dur){ abortAll.abort(); }
-    }, v => $("vDl").textContent = fmt(v));
-    signal.addEventListener("abort", ()=>{ stop(); resolve(); }, {once:true});
+    }, v => $(VAL[k]).textContent = fmt(v))));
+    signal.addEventListener("abort", ()=>{ stops.forEach(f=>f()); resolve(); }, {once:true});
   });
-  await runner.catch(()=>{});
-  if(failed) await showFailure(counter);
-  else setStatus(`モニター終了（${lastSec}秒）　使用データ量 約${fmt(bytesUsed/1e6,0)} MB${wasHidden?"　※途中でタブが裏に回ったため、その間の値は不正確な可能性があります":""}`);
+  await Promise.all(runners).catch(()=>{});
+  // 終了後は平均値を表示
+  for(const k of kinds){ const a = speed[k].filter(p=>p.t>1).map(p=>p.v); if(a.length) $(VAL[k]).textContent = fmt(mean(a)); }
+  const missing = kinds.filter(k=>counters[k].bytes===0).map(k=>NAME[k]);
+  if(failed) await showFailure(counters[kinds[0]]);
+  else setStatus(`モニター終了（${lastSec}秒）　使用データ量 約${fmt(bytesUsed/1e6,0)} MB`
+    + (missing.length ? `　※${missing.join("・")}は測れませんでした` : "")
+    + (wasHidden ? "　※途中でタブが裏に回ったため、その間の値は不正確な可能性があります" : ""));
   end(); updateStats();
 }
 
@@ -374,11 +396,11 @@ function begin(m){
   $("btnTest").disabled = m!=="test"; $("btnMon").disabled = m!=="mon";
   const b = m==="test" ? $("btnTest") : $("btnMon");
   b.textContent = "停止"; b.classList.add("stop"); b.classList.remove("primary");
-  $("monDur").disabled = true;
+  $("monDur").disabled = $("monDir").disabled = true;
 }
 function end(){
   running = false; mode = null; active(null);
-  $("btnTest").disabled = $("btnMon").disabled = $("monDur").disabled = false;
+  $("btnTest").disabled = $("btnMon").disabled = $("monDur").disabled = $("monDir").disabled = false;
   $("btnTest").textContent = "速度測定を開始"; $("btnTest").className = "primary";
   $("btnMon").textContent = "連続モニター"; $("btnMon").className = "";
 }
