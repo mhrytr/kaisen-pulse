@@ -109,7 +109,7 @@ canvas{width:100%;display:block}
   <section class="card">
     <h2>ブレの統計 <span id="stab"></span></h2>
     <div class="stats" id="stats"><div><span>まだデータがありません</span><b></b></div></div>
-    <div class="note">変動係数（CV）＝標準偏差÷平均。統計は通信の立ち上がりの最初の1秒を除いて計算しています。連続モニターの「上り下り同時」は、とくに Wi-Fi では単独で測るより低めに出ます。速度のCVが10%未満なら安定、30%以上なら大きくブレています。測定先は Cloudflare の速度測定サーバー（speed.cloudflare.com）です。モバイル回線ではデータ量にご注意ください。</div>
+    <div class="note">変動係数（CV）＝標準偏差÷平均。速度の結果と統計は、通信の立ち上がり（加速中の最初の1〜3秒）を除いて計算しています。アップロードはサーバーが受け取った量で計算しています。連続モニターの「上り下り同時」は、とくに Wi-Fi では単独で測るより低めに出ます。速度のCVが10%未満なら安定、30%以上なら大きくブレています。測定先は Cloudflare の速度測定サーバー（speed.cloudflare.com）です。モバイル回線ではデータ量にご注意ください。</div>
   </section>
 </div>
 
@@ -128,16 +128,47 @@ let bytesUsed = 0;
 const backoff = n => Math.min(8000, 400 * 2**n) * (0.75 + Math.random()*0.5);
 function noteHttp(counter, status){ counter.errs = (counter.errs||0)+1; if(status===429) counter.limited = true; if(status) counter.lastStatus = status; }
 
+// 計測エントリーが溜まりすぎないようにする
+try{ performance.setResourceTimingBufferSize?.(3000); }catch(e){}
+performance.addEventListener?.("resourcetimingbufferfull", ()=>performance.clearResourceTimings());
+
+// サーバー側の処理時間（ms）。公式ライブラリと同じく Server-Timing の cfReqDur を読む
+function serverTimeOf(entry, res){
+  for(const st of entry?.serverTiming || []){
+    if(/^cfReq(uest)?Dur(ation)?$/i.test(st.name) && st.duration > 0.01) return st.duration;
+  }
+  const h = res?.headers?.get("server-timing");
+  if(!h) return 0;
+  const m = h.match(/(?:^|,\s*)cfReq(?:uest)?Dur(?:ation)?;\s*dur=([0-9.]+)/i);
+  if(m && +m[1] > 0.01) return +m[1];
+  let sum = 0; for(const x of h.matchAll(/(?:^|,\s*)cfSpeed[a-zA-Z]*;\s*dur=([0-9.]+)/gi)) sum += +x[1];
+  return sum > 0.01 ? sum : 0;
+}
+let pingStats = {precise:0, basic:0};
+
+// 1回の Ping。詳細なタイミングが取れるときは「要求を送ってから応答が届き始めるまで」から
+// サーバーの処理時間を差し引いた、純粋な往復時間を返す
 async function pingOnce(signal){
   const ctl = new AbortController();
   const to = setTimeout(()=>ctl.abort(), 3000);
   const onAbort = ()=>ctl.abort(); signal?.addEventListener("abort", onAbort);
+  const url = `${BASE}/__down?bytes=0&r=${Math.random()}`;
   try{
     const t0 = performance.now();
-    const r = await fetch(`${BASE}/__down?bytes=0&r=${Math.random()}`, {cache:"no-store", signal:ctl.signal});
+    const r = await fetch(url, {cache:"no-store", signal:ctl.signal});
     await r.arrayBuffer();
+    const t1 = performance.now();
     if(!r.ok){ if(r.status===429) rateLimited = true; return null; }   // エラー応答は Ping として数えない
-    return performance.now() - t0;
+    await new Promise(res=>setTimeout(res, 0));   // 計測エントリーの登録を待つ
+    const e = performance.getEntriesByName(url).at(-1);
+    const server = serverTimeOf(e, r);
+    if(e && e.requestStart > 0 && e.responseStart > 0){
+      const ttfb = (e.finalResponseHeadersStart || e.responseStart) - e.requestStart;
+      pingStats.precise++;
+      return Math.max(0, ttfb - server);
+    }
+    pingStats.basic++;
+    return Math.max(0, (t1 - t0) - server);
   }catch(e){ return null; }
   finally{ clearTimeout(to); signal?.removeEventListener("abort", onAbort); }
 }
@@ -182,25 +213,38 @@ function downloadStreams(n, counter, signal){
   return Promise.all(Array.from({length:n}, one));
 }
 
+// アップロード。速度は「サーバーが受け取りを返事した時刻」で確定させる（公式ライブラリと同じ考え方）。
+// counter.bytes は表示用の送信量（ブラウザが送り出した量）で、測定値には使わない
+const UL_MIN = 64*1024;
 function uploadStreams(n, counter, signal){
-  const blobs = {};
-  const blobFor = lvl => blobs[lvl] ??= new Blob([new Uint8Array(UL_SIZES[lvl])]);
+  counter.done ??= []; counter.inflight ??= new Map(); counter.size ??= 512*1024;
+  const blobs = new Map();
+  const blobOf = sz => { if(!blobs.has(sz)) blobs.set(sz, new Blob([new Uint8Array(sz)])); return blobs.get(sz); };
   const one = () => new Promise(res => {
     let fails = 0, cur = null;
-    const onAbort = () => { cur?.abort(); res(); };
-    signal.addEventListener("abort", onAbort, {once:true});
+    signal.addEventListener("abort", () => { cur?.abort(); res(); }, {once:true});
     const loop = () => {
-      if(signal.aborted) return res();
-      const lvl = ulLevel, blob = blobFor(lvl);
+      if(signal.aborted || counter.draining) return res();
+      const lvl = ulLevel, size = Math.min(counter.size, UL_SIZES[lvl]), blob = blobOf(size);
       const x = cur = new XMLHttpRequest(); let last = 0;
+      const id = Symbol(); let start = 0;
       x.open("POST", `${BASE}/__up?r=${Math.random()}`);
       x.setRequestHeader("Content-Type","text/plain");
       x.upload.onprogress = e => { const d = e.loaded - last; last = e.loaded; counter.bytes += d; bytesUsed += d; };
       x.onloadend = () => {
-        if(signal.aborted) return res();
+        const end = performance.now();
+        if(signal.aborted) return res();   // 中断した送信は未確定のまま残す（その秒は計算しない）
+        counter.inflight.delete(id);
         const ok = x.status >= 200 && x.status < 300;
         if(ok){
-          if(last < blob.size){ const d = blob.size - last; counter.bytes += d; bytesUsed += d; }
+          if(last < size){ const d = size - last; counter.bytes += d; bytesUsed += d; }
+          counter.done.push({s:start, e:end, b:size});
+          // 1回の送信が 0.25〜1秒に収まるようにサイズを調整（毎秒のブレを細かく分解するため）
+          const dur = end - start;
+          if(size === counter.size){
+            if(dur < 250) counter.size = Math.min(counter.size*2, UL_SIZES[0]);
+            else if(dur > 1000) counter.size = Math.max(UL_MIN, Math.floor(counter.size/2));
+          }
           fails = 0; loop();
         }else{
           noteHttp(counter, x.status);
@@ -209,11 +253,19 @@ function uploadStreams(n, counter, signal){
           setTimeout(loop, backoff(fails++));
         }
       };
+      start = performance.now(); counter.inflight.set(id, start);
       x.send(blob);
     };
     loop();
   });
   return Promise.all(Array.from({length:n}, one));
+}
+
+// 確定済みの送信記録から sec 秒目（t0 起点）の速度を計算。各送信の量はその送信時間に均等に割り振る
+function confirmedMbps(done, t0, sec){
+  const a = t0 + (sec-1)*1000, b = t0 + sec*1000; let bits = 0;
+  for(const r of done){ const ov = Math.min(b, r.e) - Math.max(a, r.s); if(ov > 0) bits += r.b*8*ov/Math.max(1, r.e - r.s); }
+  return bits/1e6;
 }
 
 const sleep = (ms, signal) => new Promise(r=>{
@@ -224,7 +276,8 @@ const mbps = (bytes, sec) => sec>0 ? bytes*8/sec/1e6 : 0;
 let rateLimited = false, wasHidden = false;
 document.addEventListener("visibilitychange", ()=>{ if(document.hidden && running) wasHidden = true; });
 
-// 1秒ごとのサンプラー。タブが裏に回ってタイマーが間引かれても、実際の経過時間で計算する
+// 1秒ごとのサンプラー（ダウンロード用）。受け取ったバイト数を、実際の経過時間で割る。
+// タブが裏に回ってタイマーが間引かれても、実際の経過時間で計算する
 function sampler(counter, onSample, onLive){
   const start = performance.now();
   let lastBytes = 0, lastT = start, nextSec = 1;
@@ -242,7 +295,37 @@ function sampler(counter, onSample, onLive){
       onSample(t, v, el);
     }
   }, 200);
-  return () => clearInterval(timer);
+  return { stop: () => clearInterval(timer) };
+}
+
+// 1秒ごとのサンプラー（アップロード用）。サーバーの返事で確定した秒から順に出す。
+// まだ返事の来ていない送信がかかっている秒は、確定するまで待つ
+function confirmedSampler(counter, onSample, onLive){
+  const t0 = performance.now(); let next = 1, stopped = false;
+  const hist = [];
+  const emit = horizon => {
+    while(t0 + next*1000 <= horizon){ const t = next++; onSample(t, confirmedMbps(counter.done, t0, t)); }   // 先に進めてから通知（二重に出さない）
+    const keep = t0 + (next-1)*1000;   // もう使わない記録を捨てる
+    if(counter.done.length > 200) counter.done = counter.done.filter(r => r.e > keep);
+  };
+  const horizonAt = now => { let h = now; for(const st of counter.inflight.values()) h = Math.min(h, st); return h; };
+  const timer = setInterval(()=>{
+    const now = performance.now();
+    hist.push([now, counter.bytes]); while(hist.length>1 && now-hist[0][0] > 1000) hist.shift();
+    if(onLive && hist.length>1) onLive(mbps(counter.bytes-hist[0][1], (now-hist[0][0])/1000));
+    emit(horizonAt(now));
+  }, 200);
+  return { stop: () => { if(stopped) return; stopped = true; clearInterval(timer); emit(horizonAt(performance.now())); } };
+}
+
+// 立ち上がり（加速中）を除いた安定区間。1秒目は常に除き、
+// その後も安定時の中央値の7割に届かない先頭の秒は、3秒目まで除く
+function steady(series){
+  let pts = series.filter(p => p.t > 1);
+  if(pts.length < 3) return pts.length ? pts : series;
+  const med = median(pts.map(p => p.v));
+  while(pts.length > 2 && pts[0].t <= 3 && pts[0].v < med*0.7) pts = pts.slice(1);
+  return pts;
 }
 
 function failMessage(counter){
@@ -274,23 +357,28 @@ async function measurePhase(kind, seconds, outerSignal){
   const ctl = new AbortController();
   const fwd = ()=>ctl.abort(); outerSignal.addEventListener("abort", fwd, {once:true});
   const counter = {bytes:0, steps:0};
-  const runner = kind==="dl" ? downloadStreams(4, counter, ctl.signal) : uploadStreams(3, counter, ctl.signal);
+  const runner = kind==="dl" ? downloadStreams(6, counter, ctl.signal) : uploadStreams(4, counter, ctl.signal);
   const series = speed[kind], el = $(kind==="dl"?"vDl":"vUl");
+  const t0 = performance.now();
   await new Promise(resolve => {
-    const stop = sampler(counter, (t, v, elapsed)=>{
-      series.push({t, v}); drawAll();
-      if(elapsed >= seconds){ stop(); resolve(); }
-    }, v => el.textContent = fmt(v));
-    ctl.signal.addEventListener("abort", ()=>{ stop(); resolve(); }, {once:true});
+    let done = false;
+    const finish = () => { if(done) return; done = true; clearInterval(tick); smp.stop(); resolve(); };
+    const onSample = (t, v) => { if(t <= seconds){ series.push({t, v}); drawAll(); } if(t >= seconds) finish(); };
+    const smp = (kind==="dl" ? sampler : confirmedSampler)(counter, onSample, v => el.textContent = fmt(v));
+    const tick = setInterval(()=>{
+      const e = (performance.now()-t0)/1000;
+      // アップロードは時間になったら新しい送信を止め、送信中のものの返事を待って最後の秒を確定させる
+      if(kind==="ul" && e >= seconds) counter.draining = true;
+      if(e >= seconds + (kind==="ul" ? 5 : 1.5)) finish();   // 念のための上限
+    }, 200);
+    ctl.signal.addEventListener("abort", finish, {once:true});
   });
   ctl.abort(); outerSignal.removeEventListener("abort", fwd);
   await runner.catch(()=>{});
   if(outerSignal.aborted) throw new StopError();
   if(counter.bytes === 0) throw Object.assign(new Error("no-data"), {counter});
-  // 立ち上がりの1秒を除いた平均
-  const valid = series.filter(p=>p.t>1);
-  const avg = mean((valid.length?valid:series).map(p=>p.v));
-  el.textContent = fmt(avg);
+  if(!series.length) throw Object.assign(new Error("no-data"), {counter});
+  el.textContent = fmt(mean(steady(series).map(p=>p.v)));   // 立ち上がりを除いた平均
   if((counter.errs||0) > (counter.steps||0)) counter.warn = true;
   return counter;
 }
@@ -298,7 +386,7 @@ async function measurePhase(kind, seconds, outerSignal){
 /* ---------- 速度測定 ---------- */
 async function runTest(){
   begin("test");
-  speed = {dl:[], ul:[]}; lat = []; bytesUsed = 0; rateLimited = false; wasHidden = false;
+  speed = {dl:[], ul:[]}; lat = []; bytesUsed = 0; rateLimited = false; wasHidden = false; pingStats = {precise:0, basic:0};
   ["vDl","vUl","vPing","vJit"].forEach(id=>$(id).textContent="--");
   drawAll(); updateStats();
   const signal = abortAll.signal;
@@ -306,7 +394,7 @@ async function runTest(){
   try{
     setStatus("Ping を測定中…"); active("roPing");
     const pings = [];
-    for(let i=0;i<12 && !signal.aborted;i++){
+    for(let i=0;i<21 && !signal.aborted;i++){   // 1回目は接続の準備を含むので捨て、20回の中央値をとる
       const p = await pingOnce(signal);
       if(i>0){ lat.push({t:i, v:p}); if(p!=null){ pings.push(p); $("vPing").textContent = fmt(median(pings),1); } drawAll(); }
     }
@@ -332,7 +420,7 @@ async function runTest(){
 /* ---------- 連続モニター ---------- */
 async function runMonitor(){
   begin("mon");
-  speed = {dl:[], ul:[]}; lat = []; bytesUsed = 0; rateLimited = false; wasHidden = false;
+  speed = {dl:[], ul:[]}; lat = []; bytesUsed = 0; rateLimited = false; wasHidden = false; pingStats = {precise:0, basic:0};
   ["vDl","vUl","vPing","vJit"].forEach(id=>$(id).textContent="--");
   drawAll(); updateStats();
   const dur = +$("monDur").value;
@@ -340,21 +428,25 @@ async function runMonitor(){
   const kinds = dir==="both" ? ["dl","ul"] : [dir];
   const signal = abortAll.signal;
   const NAME = {dl:"ダウンロード", ul:"アップロード"}, VAL = {dl:"vDl", ul:"vUl"};
-  // 速度は 2 本ずつの連続転送で、遅延はそれとは別に毎秒 Ping（通信中の遅延）
+  // 速度は 4 本ずつの連続転送で、遅延はそれとは別に毎秒 Ping（通信中の遅延）
   const counters = {}, runners = [];
   for(const k of kinds){
     counters[k] = {bytes:0, steps:0};
-    runners.push((k==="dl" ? downloadStreams : uploadStreams)(2, counters[k], signal));
+    runners.push((k==="dl" ? downloadStreams : uploadStreams)(4, counters[k], signal));
   }
   let pingBusy = false, lastSec = 0, failed = false;
   active(kinds.length===1 ? (dir==="dl"?"roDl":"roUl") : null);
   if(kinds.length===2){ $("roDl").classList.add("active"); $("roUl").classList.add("active"); }
-  const stops = [];
+  const smps = [];
   await new Promise(resolve=>{
-    // 方向ごとに毎秒の値を記録。進行管理（Ping・表示・終了判定）は最初の方向のタイマーで行う
-    kinds.forEach((k, i) => stops.push(sampler(counters[k], (sec, v)=>{
-      speed[k].push({t:sec, v});
-      if(i !== 0) return;
+    // 方向ごとの毎秒の値（アップロードはサーバーの返事で確定した秒から順に入る）
+    for(const k of kinds){
+      smps.push((k==="dl" ? sampler : confirmedSampler)(counters[k], (sec, v)=>{
+        speed[k].push({t:sec, v}); drawAll(); updateStats();
+      }, v => $(VAL[k]).textContent = fmt(v)));
+    }
+    // 進行管理（Ping・状況表示・終了判定）は測定とは別のタイマーで1秒ごとに行う
+    smps.push(sampler({bytes:0}, sec=>{
       lastSec = sec;
       if(!pingBusy){
         pingBusy = true;
@@ -367,7 +459,6 @@ async function runMonitor(){
           drawAll(); updateStats();
         });
       }
-      drawAll(); updateStats();
       const remain = dur ? `残り${Math.max(0,dur-sec)}秒　` : "";
       const notes = [];
       if(kinds.some(k=>counters[k].limited)) notes.push("サーバーの制限で速度が落ちています");
@@ -375,12 +466,13 @@ async function runMonitor(){
       setStatus(`連続モニター中… ${sec}秒経過　${remain}使用データ量 約${fmt(bytesUsed/1e6,0)} MB${notes.length?"　※"+notes.join("。"):""}`);
       if(sec>=8 && kinds.every(k=>counters[k].bytes===0)){ failed = true; abortAll.abort(); }
       if(dur && sec>=dur){ abortAll.abort(); }
-    }, v => $(VAL[k]).textContent = fmt(v))));
-    signal.addEventListener("abort", ()=>{ stops.forEach(f=>f()); resolve(); }, {once:true});
+    }));
+    signal.addEventListener("abort", ()=>{ smps.forEach(m=>m.stop()); resolve(); }, {once:true});
   });
   await Promise.all(runners).catch(()=>{});
-  // 終了後は平均値を表示
-  for(const k of kinds){ const a = speed[k].filter(p=>p.t>1).map(p=>p.v); if(a.length) $(VAL[k]).textContent = fmt(mean(a)); }
+  // 終了後は立ち上がりを除いた平均値を表示
+  for(const k of kinds){ const a = steady(speed[k]).map(p=>p.v); if(a.length) $(VAL[k]).textContent = fmt(mean(a)); }
+  drawAll(); updateStats();
   const missing = kinds.filter(k=>counters[k].bytes===0).map(k=>NAME[k]);
   if(failed) await showFailure(counters[kinds[0]]);
   else setStatus(`モニター終了（${lastSec}秒）　使用データ量 約${fmt(bytesUsed/1e6,0)} MB`
@@ -420,9 +512,8 @@ function updateStats(){
   const rows = [];
   let worstCv = null;
   for(const [k,name] of [["dl","下り"],["ul","上り"]]){
-    // 立ち上がり（加速中）の1秒目は除く。グラフには表示したまま
-    const steady = speed[k].filter(p=>p.t>1);
-    const a = (steady.length>=2 ? steady : speed[k]).map(p=>p.v); if(a.length<2) continue;
+    // 立ち上がり（加速中）は除く。グラフには表示したまま
+    const a = steady(speed[k]).map(p=>p.v); if(a.length<2) continue;
     const m = mean(a), cv = m? sd(a)/m*100 : 0;
     if(m>0) worstCv = Math.max(worstCv??0, cv);
     rows.push([`${name} 平均`, fmt(m)+" Mbps"],[`${name} 最小 / 最大`, `${fmt(Math.min(...a))} / ${fmt(Math.max(...a))}`],
@@ -434,6 +525,8 @@ function updateStats(){
               ["ジッター", fmt(jitter(l),1)+" ms"]);
     const loss = lat.filter(x=>x.v==null).length/lat.length*100;
     rows.push(["応答なしの割合", fmt(loss,1)+" %"]);
+    if(pingStats.precise || pingStats.basic)
+      rows.push(["Ping の計測方式", pingStats.precise >= pingStats.basic ? "精密（通信時間のみ）" : "簡易（ブラウザ処理込み）"]);
   }
   $("stats").innerHTML = rows.length ? rows.map(([a,b])=>`<div><span>${a}</span><b>${b}</b></div>`).join("") : `<div><span>まだデータがありません</span><b></b></div>`;
   if(worstCv==null){ $("stab").innerHTML=""; return; }
