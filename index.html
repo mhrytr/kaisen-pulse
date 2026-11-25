@@ -34,7 +34,11 @@ body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 var(--font-body
 header{display:flex;flex-wrap:wrap;align-items:end;justify-content:space-between;gap:12px}
 h1{margin:0;font-size:26px;letter-spacing:.02em}
 h1 small{display:block;font-size:13px;font-weight:400;color:var(--muted)}
-.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
+.field{display:grid;gap:2px;font-size:11px;color:var(--muted);letter-spacing:.04em}
+.field select{font-size:16px;color:var(--fg);letter-spacing:0}
+.sep{width:1px;align-self:stretch;background:var(--line);margin:0 4px}
+@media (max-width:720px){.sep{display:none}}
 button,select{font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--fg);padding:9px 16px;cursor:pointer}
 button.primary{background:var(--dl);border-color:var(--dl);color:#fff;font-weight:700}
 button.stop{background:var(--bad);border-color:var(--bad);color:#fff}
@@ -70,18 +74,23 @@ canvas{width:100%;display:block}
   <header>
     <h1>回線パルス<small>インターネット速度と毎秒のブレを測る</small></h1>
     <div class="controls">
+      <label class="field" for="monDir"><span>測る方向</span>
+        <select id="monDir">
+          <option value="both" selected>上り・下り両方</option>
+          <option value="dl">下り（ダウンロード）のみ</option>
+          <option value="ul">上り（アップロード）のみ</option>
+        </select>
+      </label>
       <button id="btnTest" class="primary">速度測定を開始</button>
-      <select id="monDir" aria-label="連続モニターで測る方向">
-        <option value="both" selected>上り下り同時</option>
-        <option value="dl">下りのみ</option>
-        <option value="ul">上りのみ</option>
-      </select>
-      <select id="monDur" aria-label="モニター時間">
-        <option value="30">30秒</option>
-        <option value="60" selected>60秒</option>
-        <option value="180">3分</option>
-        <option value="0">停止するまで</option>
-      </select>
+      <span class="sep" aria-hidden="true"></span>
+      <label class="field" for="monDur"><span>モニター時間</span>
+        <select id="monDur">
+          <option value="30">30秒</option>
+          <option value="60" selected>60秒</option>
+          <option value="180">3分</option>
+          <option value="0">停止するまで</option>
+        </select>
+      </label>
       <button id="btnMon">連続モニター</button>
     </div>
   </header>
@@ -92,7 +101,7 @@ canvas{width:100%;display:block}
     <div class="ro" id="roPing"><div class="lbl"><i style="background:var(--lat)"></i>Ping</div><div class="val"><span id="vPing">--</span><span class="unit">ms</span></div></div>
     <div class="ro" id="roJit"><div class="lbl"><i style="background:var(--muted)"></i>ジッター</div><div class="val"><span id="vJit">--</span><span class="unit">ms</span></div></div>
   </div>
-  <div class="status" id="status">「速度測定を開始」で Ping → ダウンロード → アップロードの順に測ります。</div>
+  <div class="status" id="status"></div>
 
   <section class="card">
     <h2>毎秒の通信速度 <span id="speedMeta">1秒ごとの実測値</span></h2>
@@ -109,7 +118,7 @@ canvas{width:100%;display:block}
   <section class="card">
     <h2>ブレの統計 <span id="stab"></span></h2>
     <div class="stats" id="stats"><div><span>まだデータがありません</span><b></b></div></div>
-    <div class="note">変動係数（CV）＝標準偏差÷平均。速度の結果と統計は、通信の立ち上がり（加速中の最初の1〜3秒）を除いて計算しています。アップロードはサーバーが受け取った量で計算しています。連続モニターの「上り下り同時」は、とくに Wi-Fi では単独で測るより低めに出ます。速度のCVが10%未満なら安定、30%以上なら大きくブレています。測定先は Cloudflare の速度測定サーバー（speed.cloudflare.com）です。モバイル回線ではデータ量にご注意ください。</div>
+    <div class="note">変動係数（CV）＝標準偏差÷平均。速度の結果と統計は、通信の立ち上がり（加速中の最初の1〜3秒）を除いて計算しています。アップロードはサーバーが受け取った量で計算しています。連続モニターで「上り・下り両方」を選ぶと同時に測るため、とくに Wi-Fi では片方ずつ測るより低めに出ます。速度のCVが10%未満なら安定、30%以上なら大きくブレています。測定先は Cloudflare の速度測定サーバー（speed.cloudflare.com）です。モバイル回線ではデータ量にご注意ください。</div>
   </section>
 </div>
 
@@ -404,11 +413,13 @@ async function runTest(){
     $("vJit").textContent = fmt(jitter(pings),1);
     updateStats();
 
-    setStatus("ダウンロード速度を測定中…（10秒）"); active("roDl");
-    const c1 = await measurePhase("dl", 10, signal);
-    setStatus("アップロード速度を測定中…（10秒）"); active("roUl");
-    const c2 = await measurePhase("ul", 10, signal);
-    if(c1.warn || c2.warn) warns.push("途中でサーバーエラーがあり、値が低めに出ている可能性があります");
+    // 選んだ方向だけを、下り → 上りの順に測る
+    const counters = [];
+    for(const k of kindsOf($("monDir").value)){
+      setStatus(`${k==="dl"?"ダウンロード":"アップロード"}速度を測定中…（10秒）`); active(k==="dl"?"roDl":"roUl");
+      counters.push(await measurePhase(k, 10, signal));
+    }
+    if(counters.some(c=>c.warn)) warns.push("途中でサーバーエラーがあり、値が低めに出ている可能性があります");
     if(wasHidden) warns.push("測定中にタブが裏に回ったため、値が不正確な可能性があります");
     setStatus(`測定完了　使用データ量 約${fmt(bytesUsed/1e6,0)} MB${warns.length?"　※"+warns.join("。"):""}`);
   }catch(e){
@@ -425,7 +436,8 @@ async function runMonitor(){
   drawAll(); updateStats();
   const dur = +$("monDur").value;
   const dir = $("monDir").value;
-  const kinds = dir==="both" ? ["dl","ul"] : [dir];
+  setStatus("連続モニターを開始しています…");
+  const kinds = kindsOf(dir);
   const signal = abortAll.signal;
   const NAME = {dl:"ダウンロード", ul:"アップロード"}, VAL = {dl:"vDl", ul:"vUl"};
   // 速度は 4 本ずつの連続転送で、遅延はそれとは別に毎秒 Ping（通信中の遅延）
@@ -482,8 +494,19 @@ async function runMonitor(){
 }
 
 /* ---------- UI 状態 ---------- */
+const kindsOf = dir => dir==="both" ? ["dl","ul"] : [dir];
+let showingHint = true;
+function hint(){
+  const d = $("monDir").value;
+  const order = {both:"ダウンロード → アップロード", dl:"ダウンロード", ul:"アップロード"}[d];
+  const mon = {both:"ダウンロードとアップロードを同時に", dl:"ダウンロードを", ul:"アップロードを"}[d];
+  setStatus(`「速度測定を開始」で Ping → ${order}の順に測ります。「連続モニター」は${mon}測り続けます。`);
+  showingHint = true;
+}
+$("monDir").addEventListener("change", ()=>{ if(!running && showingHint) hint(); });
 let mode = null;
 function begin(m){
+  showingHint = false;
   running = true; mode = m; abortAll = new AbortController();
   $("btnTest").disabled = m!=="test"; $("btnMon").disabled = m!=="mon";
   const b = m==="test" ? $("btnTest") : $("btnMon");
@@ -593,6 +616,7 @@ addEventListener("resize", drawAll);
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawAll);
 document.fonts?.ready.then(drawAll);
 drawAll();
+hint();
 </script>
 </body>
 </html>
